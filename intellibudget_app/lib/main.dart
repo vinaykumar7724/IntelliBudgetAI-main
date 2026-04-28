@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
@@ -9,7 +10,6 @@ void main() {
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return const MaterialApp(
@@ -22,13 +22,13 @@ class MyApp extends StatelessWidget {
 
 class BudgetWebView extends StatefulWidget {
   const BudgetWebView({super.key});
-
   @override
   State<BudgetWebView> createState() => _BudgetWebViewState();
 }
 
 class _BudgetWebViewState extends State<BudgetWebView> {
   late final WebViewController _controller;
+  final SpeechToText _speech = SpeechToText();
   bool _isLoading = true;
 
   @override
@@ -41,24 +41,53 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onPageFinished: (_) => setState(() => _isLoading = false),
         onWebResourceError: (_) => setState(() => _isLoading = false),
       ))
+      ..addJavaScriptChannel(
+        'FlutterSpeech',
+        onMessageReceived: (msg) async {
+          if (msg.message == 'start') {
+            await _startListening();
+          } else if (msg.message == 'stop') {
+            await _stopListening();
+          }
+        },
+      )
       ..loadRequest(Uri.parse(
           'https://intellibudgetai-main-production.up.railway.app'));
 
-    // Grant microphone permission for Android
     if (_controller.platform is AndroidWebViewController) {
-      AndroidWebViewController.enableDebugging(true);
       (_controller.platform as AndroidWebViewController)
-          .setOnShowFileSelector((_) async => []);
-      (_controller.platform as AndroidWebViewController)
-          .setGeolocationPermissionsPromptCallbacks(
-        onShowPrompt: (request) async {
-          return GeolocationPermissionsResponse(
-            allow: true,
-            retain: true,
-          );
-        },
-      );
+          .setMediaPlaybackRequiresUserGesture(false);
     }
+  }
+
+  Future<void> _startListening() async {
+    bool available = await _speech.initialize(
+      onError: (error) {
+        _controller.runJavaScript(
+            "window.onSpeechError('${error.errorMsg}')");
+      },
+    );
+
+    if (available) {
+      await _speech.listen(
+        onResult: (result) {
+          if (result.finalResult) {
+            final text = result.recognizedWords;
+            _controller.runJavaScript(
+                "window.onSpeechResult('$text')");
+            _speech.stop();
+          }
+        },
+        localeId: 'en_IN',
+      );
+    } else {
+      _controller.runJavaScript(
+          "window.onSpeechError('Microphone not available')");
+    }
+  }
+
+  Future<void> _stopListening() async {
+    await _speech.stop();
   }
 
   @override
