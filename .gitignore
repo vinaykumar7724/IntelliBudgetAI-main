@@ -1,0 +1,33 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.Python
+.DS_Store
+instance/
+*.db
+*.sqlite
+*.sqlite3
+.env
+
+# Android / Emulator
+android/emulator/
+
+# Binaries
+*.exe
+*.dll
+
+# Build & cache
+build/
+.gradle/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Database
+*.db
