@@ -8,8 +8,12 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isAndroid) {
+    WebViewPlatform.instance = AndroidWebViewPlatform();
+  }
   runApp(const MyApp());
 }
 
