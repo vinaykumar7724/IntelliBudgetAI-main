@@ -104,32 +104,47 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       final dir = await getExternalStorageDirectory();
       final savePath = '${dir!.path}/$fileName';
 
-      // Get cookies from WebView
-      final cookieResult = await _controller
-          .runJavaScriptReturningResult('document.cookie');
-      String cookieHeader = cookieResult.toString();
-      if (cookieHeader.startsWith('"')) {
-        cookieHeader = cookieHeader.substring(1, cookieHeader.length - 1);
+      // Step 1: Generate one-time token via browser session (JS fetch)
+      final tokenResult = await _controller.runJavaScriptReturningResult('''
+        (async () => {
+          try {
+            const r = await fetch('/generate-download-token');
+            const d = await r.json();
+            return d.token || '';
+          } catch(e) {
+            return '';
+          }
+        })()
+      ''');
+
+      final token = tokenResult.toString().replaceAll('"', '').trim();
+
+      if (token.isEmpty) {
+        _showMsg('❌ Session expired — please login again');
+        setState(() => _isDownloading = false);
+        return;
       }
+
+      // Step 2: Download file using token (no cookie needed)
+      const baseUrl =
+          'https://intellibudgetai-main-production.up.railway.app';
+      final downloadUrl = isPdf
+          ? '$baseUrl/export/pdf-token/$token'
+          : '$baseUrl/export/csv-token/$token';
 
       final dio = Dio();
       final response = await dio.get(
-        url,
+        downloadUrl,
         options: Options(
-          headers: {
-            'Cookie': cookieHeader,
-            'Accept': isPdf ? 'application/pdf' : 'text/csv',
-          },
           responseType: ResponseType.bytes,
           followRedirects: true,
           validateStatus: (status) => status! < 500,
         ),
       );
 
-      // Check if server returned HTML instead of file (session expired)
       final contentType = response.headers['content-type']?.first ?? '';
       if (contentType.contains('text/html')) {
-        _showMsg('❌ Session expired — please login again');
+        _showMsg('❌ Download failed — try again');
         setState(() => _isDownloading = false);
         return;
       }
