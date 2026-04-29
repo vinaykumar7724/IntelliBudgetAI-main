@@ -2,6 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'dart:io';
+import 'package:dio/dio.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 void main() {
@@ -41,24 +46,21 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onPageStarted: (_) => setState(() => _isLoading = true),
         onPageFinished: (_) => setState(() => _isLoading = false),
         onWebResourceError: (_) => setState(() => _isLoading = false),
-        onNavigationRequest: (NavigationRequest request) async {
-          final url = request.url;
-          // Open all export/download links in external browser
-          if (url.contains('/export') ||
-              url.contains('/export/pdf') ||
-              url.contains('.pdf') ||
-              url.contains('.csv')) {
-            final uri = Uri.parse(url);
-            if (await canLaunchUrl(uri)) {
-              await launchUrl(
-                uri,
-                mode: LaunchMode.externalApplication,
-              );
-            }
-            return NavigationDecision.prevent;
+      onNavigationRequest: (NavigationRequest request) async {
+        final url = request.url;
+        if (url.contains('/export/pdf') || url.contains('.pdf')) {
+         await _downloadPdf(url);
+         return NavigationDecision.prevent;
+       }
+       if (url.contains('/export/csv') || url.contains('.csv')) {
+         final uri = Uri.parse(url);
+         if (await canLaunchUrl(uri)) {
+           await launchUrl(uri, mode: LaunchMode.externalApplication);
           }
-          return NavigationDecision.navigate;
-        },
+           return NavigationDecision.prevent;
+        }
+        return NavigationDecision.navigate;
+},
       ))
       ..addJavaScriptChannel(
         'FlutterSpeech',
@@ -83,6 +85,28 @@ class _BudgetWebViewState extends State<BudgetWebView> {
     }
   }
 
+  Future<void> _downloadPdf(String url) async {
+  try {
+    if (Platform.isAndroid) {
+      final status = await Permission.storage.request();
+      if (!status.isGranted) return;
+    }
+
+    final dir = await getApplicationDocumentsDirectory();
+    final filePath = '${dir.path}/budget_report.pdf';
+
+    final dio = Dio();
+    await dio.download(url, filePath,
+        options: Options(responseType: ResponseType.bytes));
+
+    final result = await OpenFilex.open(filePath);
+    if (result.type != ResultType.done) {
+      debugPrint('Could not open PDF: ${result.message}');
+    }
+  } catch (e) {
+    debugPrint('PDF download error: $e');
+  }
+}
   Future<void> _startListening() async {
     bool available = await _speech.initialize(
       onError: (error) {

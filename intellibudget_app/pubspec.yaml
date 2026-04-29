@@ -32,13 +32,13 @@ dependencies:
     sdk: flutter
   webview_flutter: ^4.10.0
   webview_flutter_android: ^4.3.0
-  speech_to_text: ^6.6.2
+  speech_to_text: ^7.0.0
   url_launcher: ^6.3.0
-  permission_handler: ^11.3.0
+  permission_handler: ^12.0.1
   http: ^1.2.1
   path_provider: ^2.1.3
   open_filex: ^4.3.4          # opens the saved PDF with the device's PDF viewer
-  share_plus: ^9.0.0          # fallback: share/save via OS share sheet
+  share_plus: ^13.1.0          # fallback: share/save via OS share sheet
   shared_preferences: ^2.3.1  # persists session cookie across app restarts
   provider: ^6.1.2   
   dio: ^5.4.0         # for AuthService as ChangeNotifier 
