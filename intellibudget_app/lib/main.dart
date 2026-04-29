@@ -92,12 +92,17 @@ class _BudgetWebViewState extends State<BudgetWebView> {
   Future<void> _downloadFile(
       String url, String fileName, String mime) async {
     try {
-      if (Platform.isAndroid) {
-        final status = await Permission.storage.request();
-        if (!status.isGranted) {
-          debugPrint('DEBUG: Storage permission denied');
-          return;
-        }
+     if (Platform.isAndroid) {
+       // Android 13+ (SDK 33+) doesn't need storage permission for app-private dir
+        // Only request for older Android
+       try {
+         final status = await Permission.storage.request();
+         if (!status.isGranted && !status.isLimited) {
+           // On Android 13+ this permission is deprecated — continue anyway
+           // getApplicationDocumentsDirectory() works without it
+           debugPrint('DEBUG: Storage permission not granted but continuing...');
+         }
+       } catch (_) {}
       }
 
       String cookieHeader = '';
