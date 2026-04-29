@@ -757,6 +757,46 @@ def api_delete_budget(budget_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
+    
+# ── PDF Export API (mobile) ───────────────────────────────────────────────────
+@app.route('/api/export/pdf', methods=['GET'])
+@login_required
+def api_export_pdf():
+    today = datetime.utcnow()
+    from_date_str = request.args.get('from_date')
+    to_date_str   = request.args.get('to_date')
+
+    try:
+        from_date = datetime.strptime(from_date_str, '%Y-%m-%d') \
+            if from_date_str else datetime(today.year, today.month, 1)
+        to_date = datetime.strptime(to_date_str, '%Y-%m-%d').replace(
+            hour=23, minute=59, second=59) \
+            if to_date_str else today
+    except ValueError:
+        from_date = datetime(today.year, today.month, 1)
+        to_date   = today
+
+    expenses = Expense.query.filter(
+        Expense.user_id == current_user.id,
+        Expense.date    >= from_date,
+        Expense.date    <= to_date,
+    ).order_by(Expense.date.desc()).all()
+
+    buf = generate_expense_report(
+        user      = current_user,
+        expenses  = expenses,
+        from_date = from_date,
+        to_date   = to_date,
+        salary    = current_user.monthly_salary or 0,
+    )
+
+    filename = f'expenses_{from_date.strftime("%Y%m%d")}_{to_date.strftime("%Y%m%d")}.pdf'
+    return send_file(
+        buf,
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=filename,
+    )
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
