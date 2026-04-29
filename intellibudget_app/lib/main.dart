@@ -1,3 +1,5 @@
+import 'dart:io';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
@@ -74,9 +76,21 @@ class _BudgetWebViewState extends State<BudgetWebView> {
     }
   }
 
+  Future<bool> _requestStoragePermission() async {
+    if (!Platform.isAndroid) return true;
+    final info = await DeviceInfoPlugin().androidInfo;
+    if (info.version.sdkInt >= 30) {
+      final status = await Permission.manageExternalStorage.request();
+      return status.isGranted;
+    } else {
+      final status = await Permission.storage.request();
+      return status.isGranted;
+    }
+  }
+
   Future<void> _downloadFile(String url) async {
-    final status = await Permission.storage.request();
-    if (!status.isGranted) {
+    final granted = await _requestStoragePermission();
+    if (!granted) {
       _showMsg('❌ Storage permission denied');
       return;
     }
