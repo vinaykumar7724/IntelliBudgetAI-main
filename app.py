@@ -798,6 +798,41 @@ def api_export_pdf():
         download_name=filename,
     )
 
+import secrets
+download_tokens = {}
+
+@app.route('/generate-download-token')
+@login_required
+def generate_download_token():
+    token = secrets.token_urlsafe(32)
+    download_tokens[token] = current_user.id
+    return jsonify({'token': token})
+
+@app.route('/export/pdf-token/<token>')
+def export_pdf_token(token):
+    user_id = download_tokens.pop(token, None)
+    if not user_id:
+        return 'Invalid or expired token', 403
+    # Copy your existing export_pdf logic here but use user_id instead of current_user.id
+    from flask_login import login_user
+    user = User.query.get(user_id)
+    if not user:
+        return 'User not found', 404
+    login_user(user)
+    return export_pdf()
+
+@app.route('/export/csv-token/<token>')
+def export_csv_token(token):
+    user_id = download_tokens.pop(token, None)
+    if not user_id:
+        return 'Invalid or expired token', 403
+    user = User.query.get(user_id)
+    if not user:
+        return 'User not found', 404
+    login_user(user)
+    return export_csv()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
