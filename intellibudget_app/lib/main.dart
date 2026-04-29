@@ -1,6 +1,6 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
-import 'package:open_file/open_file.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart';
@@ -120,7 +120,7 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         _downloadMsg = '✅ Saved: $fileName';
       });
 
-      await OpenFile.open(savePath);
+      await OpenFilex.open(savePath);
 
       Future.delayed(const Duration(seconds: 3), () {
         if (mounted) setState(() => _downloadMsg = '');
