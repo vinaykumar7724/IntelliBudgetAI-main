@@ -7,7 +7,6 @@ import 'package:dio/dio.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -46,21 +45,18 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onPageStarted: (_) => setState(() => _isLoading = true),
         onPageFinished: (_) => setState(() => _isLoading = false),
         onWebResourceError: (_) => setState(() => _isLoading = false),
-      onNavigationRequest: (NavigationRequest request) async {
-        final url = request.url;
-        if (url.contains('/export/pdf') || url.contains('.pdf')) {
-         await _downloadPdf(url);
-         return NavigationDecision.prevent;
-       }
-       if (url.contains('/export/csv') || url.contains('.csv')) {
-         final uri = Uri.parse(url);
-         if (await canLaunchUrl(uri)) {
-           await launchUrl(uri, mode: LaunchMode.externalApplication);
-          }
+        onNavigationRequest: (NavigationRequest request) async {
+         final url = request.url;
+         if (url.contains('/export/pdf') || url.contains('.pdf')) {
+           await _downloadFile(url, 'budget_report.pdf', 'application/pdf');
            return NavigationDecision.prevent;
         }
-        return NavigationDecision.navigate;
-},
+       if (url.contains('/export/csv') || url.contains('.csv')) {
+         await _downloadFile(url, 'budget_report.csv', 'text/csv');
+         return NavigationDecision.prevent;
+     }
+     return NavigationDecision.navigate;
+    },
       ))
       ..addJavaScriptChannel(
         'FlutterSpeech',
@@ -84,27 +80,44 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       androidController.setOnShowFileSelector((_) async => []);
     }
   }
-
-  Future<void> _downloadPdf(String url) async {
+Future<void> _downloadFile(String url, String fileName, String mime) async {
   try {
     if (Platform.isAndroid) {
       final status = await Permission.storage.request();
       if (!status.isGranted) return;
     }
 
+    // Grab cookies from WebView session
+    String cookieHeader = '';
+if (_controller.platform is AndroidWebViewController) {
+  final androidController = _controller.platform as AndroidWebViewController;
+  cookieHeader = await _controller.runJavaScriptReturningResult(
+    'document.cookie'
+  ) as String;
+  // strip surrounding quotes JS returns
+  cookieHeader = cookieHeader.replaceAll('"', '');
+}
     final dir = await getApplicationDocumentsDirectory();
-    final filePath = '${dir.path}/budget_report.pdf';
+    final filePath = '${dir.path}/$fileName';
 
     final dio = Dio();
-    await dio.download(url, filePath,
-        options: Options(responseType: ResponseType.bytes));
+    await dio.download(
+      url,
+      filePath,
+      options: Options(
+        responseType: ResponseType.bytes,
+        headers: {
+          'Cookie': cookieHeader,
+          'Accept': mime,
+        },
+        followRedirects: false,
+        validateStatus: (s) => s != null && s < 400,
+      ),
+    );
 
-    final result = await OpenFilex.open(filePath);
-    if (result.type != ResultType.done) {
-      debugPrint('Could not open PDF: ${result.message}');
-    }
+    await OpenFilex.open(filePath);
   } catch (e) {
-    debugPrint('PDF download error: $e');
+    debugPrint('Download error: $e');
   }
 }
   Future<void> _startListening() async {
