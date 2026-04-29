@@ -41,16 +41,20 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onPageStarted: (_) => setState(() => _isLoading = true),
         onPageFinished: (_) => setState(() => _isLoading = false),
         onWebResourceError: (_) => setState(() => _isLoading = false),
-        onNavigationRequest: (NavigationRequest request) {
-          // Open PDF and CSV downloads in external browser
+        onNavigationRequest: (NavigationRequest request) async {
           final url = request.url;
+          // Open all export/download links in external browser
           if (url.contains('/export') ||
+              url.contains('/export/pdf') ||
               url.contains('.pdf') ||
               url.contains('.csv')) {
-            launchUrl(
-              Uri.parse(url),
-              mode: LaunchMode.externalApplication,
-            );
+            final uri = Uri.parse(url);
+            if (await canLaunchUrl(uri)) {
+              await launchUrl(
+                uri,
+                mode: LaunchMode.externalApplication,
+              );
+            }
             return NavigationDecision.prevent;
           }
           return NavigationDecision.navigate;
