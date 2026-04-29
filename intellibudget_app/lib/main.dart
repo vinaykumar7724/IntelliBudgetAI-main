@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -40,6 +41,20 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onPageStarted: (_) => setState(() => _isLoading = true),
         onPageFinished: (_) => setState(() => _isLoading = false),
         onWebResourceError: (_) => setState(() => _isLoading = false),
+        onNavigationRequest: (NavigationRequest request) {
+          // Open PDF and CSV downloads in external browser
+          final url = request.url;
+          if (url.contains('/export') ||
+              url.contains('.pdf') ||
+              url.contains('.csv')) {
+            launchUrl(
+              Uri.parse(url),
+              mode: LaunchMode.externalApplication,
+            );
+            return NavigationDecision.prevent;
+          }
+          return NavigationDecision.navigate;
+        },
       ))
       ..addJavaScriptChannel(
         'FlutterSpeech',
@@ -55,8 +70,12 @@ class _BudgetWebViewState extends State<BudgetWebView> {
           'https://intellibudgetai-main-production.up.railway.app'));
 
     if (_controller.platform is AndroidWebViewController) {
-      (_controller.platform as AndroidWebViewController)
-          .setMediaPlaybackRequiresUserGesture(false);
+      final androidController =
+          _controller.platform as AndroidWebViewController;
+      androidController.setMediaPlaybackRequiresUserGesture(false);
+
+      // Handle file downloads (PDF, CSV)
+      androidController.setOnShowFileSelector((_) async => []);
     }
   }
 
@@ -72,9 +91,10 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       await _speech.listen(
         onResult: (result) {
           if (result.finalResult) {
-            final text = result.recognizedWords;
-            _controller.runJavaScript(
-                "window.onSpeechResult('$text')");
+            final text = result.recognizedWords
+                .replaceAll("'", "\\'")
+                .replaceAll('"', '\\"');
+            _controller.runJavaScript("window.onSpeechResult('$text')");
             _speech.stop();
           }
         },
