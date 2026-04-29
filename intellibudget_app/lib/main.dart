@@ -7,13 +7,9 @@ import 'package:dio/dio.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter/foundation.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  if (!kIsWeb && Platform.isAndroid) {
-    WebViewPlatform.instance = AndroidWebViewPlatform();
-  }
   runApp(const MyApp());
 }
 
@@ -92,17 +88,12 @@ class _BudgetWebViewState extends State<BudgetWebView> {
   Future<void> _downloadFile(
       String url, String fileName, String mime) async {
     try {
-     if (Platform.isAndroid) {
-       // Android 13+ (SDK 33+) doesn't need storage permission for app-private dir
-        // Only request for older Android
-       try {
-         final status = await Permission.storage.request();
-         if (!status.isGranted && !status.isLimited) {
-           // On Android 13+ this permission is deprecated — continue anyway
-           // getApplicationDocumentsDirectory() works without it
-           debugPrint('DEBUG: Storage permission not granted but continuing...');
-         }
-       } catch (_) {}
+      if (Platform.isAndroid) {
+        final status = await Permission.storage.request();
+        if (!status.isGranted) {
+          debugPrint('DEBUG: Storage permission denied');
+          return;
+        }
       }
 
       String cookieHeader = '';
