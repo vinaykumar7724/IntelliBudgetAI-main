@@ -1,4 +1,5 @@
 import os
+import secrets
 from datetime import datetime
 from flask_cors import CORS
 from flask import Flask, render_template, url_for, flash, redirect, request, jsonify, send_file
@@ -26,6 +27,8 @@ db.init_app(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
+download_tokens = {}
+
 @app.before_request
 def mobile_auth_middleware():
     user_id = request.headers.get('X-User-Id')
@@ -44,7 +47,7 @@ def load_user(user_id):
 
 chatbot = Chatbot()
 
-# ── Default categories (always available to every user) ───────────────────────
+# ── Default categories ────────────────────────────────────────────────────────
 DEFAULT_CATEGORIES = [
     {'name': 'Food',       'icon': '🍔', 'color': '#f97316'},
     {'name': 'Transport',  'icon': '🚗', 'color': '#3b82f6'},
@@ -57,7 +60,6 @@ DEFAULT_CATEGORIES = [
 
 
 def get_all_categories(user_id):
-    """Return merged list of default + user-defined categories."""
     user_cats  = UserCategory.query.filter_by(user_id=user_id).all()
     user_names = {c.name for c in user_cats}
     merged     = [d for d in DEFAULT_CATEGORIES if d['name'] not in user_names]
@@ -150,7 +152,6 @@ def dashboard():
     from_date_str = request.args.get('from_date')
     to_date_str   = request.args.get('to_date')
 
-    # Support both custom date range AND legacy month/year selectors
     if from_date_str and to_date_str:
         try:
             start       = datetime.strptime(from_date_str, '%Y-%m-%d')
@@ -205,7 +206,7 @@ def dashboard():
     )
 
 
-# ── Expenses: edit/delete (Dashboard) ─────────────────────────────────────────
+# ── Expenses ──────────────────────────────────────────────────────────────────
 
 @app.route('/expenses/<int:expense_id>/delete', methods=['POST'])
 @login_required
@@ -219,7 +220,6 @@ def delete_expense(expense_id):
         db.session.rollback()
         flash(f'Could not delete expense: {e}', 'danger')
 
-    # Preserve dashboard filter (range view) if present
     from_date = request.form.get('from_date')
     to_date = request.form.get('to_date')
     if from_date and to_date:
@@ -232,18 +232,18 @@ def delete_expense(expense_id):
 def update_expense(expense_id):
     exp = Expense.query.filter_by(id=expense_id, user_id=current_user.id).first_or_404()
 
-    amount = request.form.get('amount')
-    category = (request.form.get('category') or '').strip()
+    amount      = request.form.get('amount')
+    category    = (request.form.get('category') or '').strip()
     description = (request.form.get('description') or '').strip()
-    date_str = request.form.get('date')
+    date_str    = request.form.get('date')
 
     try:
         amt = float(amount)
         if amt <= 0:
             flash('Amount must be positive', 'danger')
             return redirect(url_for('dashboard'))
-        exp.amount = amt
-        exp.category = category or exp.category
+        exp.amount      = amt
+        exp.category    = category or exp.category
         exp.description = description
         if date_str:
             exp.date = datetime.strptime(date_str, '%Y-%m-%d')
@@ -257,7 +257,7 @@ def update_expense(expense_id):
         flash(f'Could not update expense: {e}', 'danger')
 
     from_date = request.form.get('from_date')
-    to_date = request.form.get('to_date')
+    to_date   = request.form.get('to_date')
     if from_date and to_date:
         return redirect(url_for('dashboard', from_date=from_date, to_date=to_date))
     return redirect(url_for('dashboard'))
@@ -271,7 +271,6 @@ def chatbot_view():
     if request.method == 'POST':
         message  = request.form.get('message')
         response = chatbot.handle_message(message, current_user)
-        # Rich HTML responses must not get literal newlines turned into <br>
         if 'chat-rich-wrapper' not in response:
             response = response.replace('\n', '<br>')
         return jsonify({'response': response})
@@ -294,14 +293,12 @@ def budgets():
             flash('Budget added', 'success')
         except ValueError:
             flash('Invalid amount', 'danger')
-
     return redirect(url_for('profile'))
 
 
 @app.route('/budgets/<int:budget_id>/update', methods=['POST'])
 @login_required
 def update_budget(budget_id):
-    """Update an existing budget limit."""
     limit_amount = request.form.get('limit_amount')
     b = Budget.query.filter_by(id=budget_id, user_id=current_user.id).first_or_404()
     try:
@@ -384,7 +381,7 @@ def export_csv():
     return send_file(tmp_path, as_attachment=True)
 
 
-# ── PDF Export (Feature 3) ────────────────────────────────────────────────────
+# ── PDF Export ────────────────────────────────────────────────────────────────
 
 @app.route('/export/pdf')
 @login_required
@@ -421,6 +418,95 @@ def export_pdf():
                      as_attachment=True, download_name=filename)
 
 
+# ── Token-based download (mobile app) ────────────────────────────────────────
+
+@app.route('/generate-download-token')
+@login_required
+def generate_download_token():
+    token = secrets.token_urlsafe(32)
+    download_tokens[token] = {
+        'user_id':   current_user.id,
+        'from_date': request.args.get('from_date', ''),
+        'to_date':   request.args.get('to_date', ''),
+    }
+    return jsonify({'token': token})
+
+
+@app.route('/export/pdf-token/<token>')
+def export_pdf_token(token):
+    data = download_tokens.pop(token, None)
+    if not data:
+        return 'Invalid or expired token', 403
+
+    user = User.query.get(data['user_id'])
+    if not user:
+        return 'User not found', 404
+
+    today = datetime.utcnow()
+    from_date_str = data.get('from_date')
+    to_date_str   = data.get('to_date')
+
+    try:
+        from_date = datetime.strptime(from_date_str, '%Y-%m-%d') \
+                    if from_date_str else datetime(today.year, today.month, 1)
+        to_date   = datetime.strptime(to_date_str, '%Y-%m-%d').replace(
+                        hour=23, minute=59, second=59) \
+                    if to_date_str else today
+    except ValueError:
+        from_date = datetime(today.year, today.month, 1)
+        to_date   = today
+
+    expenses = Expense.query.filter(
+        Expense.user_id == data['user_id'],
+        Expense.date    >= from_date,
+        Expense.date    <= to_date,
+    ).order_by(Expense.date.desc()).all()
+
+    buf = generate_expense_report(
+        user      = user,
+        expenses  = expenses,
+        from_date = from_date,
+        to_date   = to_date,
+        salary    = user.monthly_salary or 0,
+    )
+    filename = f'expenses_{from_date.strftime("%Y%m%d")}_{to_date.strftime("%Y%m%d")}.pdf'
+    return send_file(buf, mimetype='application/pdf',
+                     as_attachment=True, download_name=filename)
+
+
+@app.route('/export/csv-token/<token>')
+def export_csv_token(token):
+    data = download_tokens.pop(token, None)
+    if not data:
+        return 'Invalid or expired token', 403
+
+    user = User.query.get(data['user_id'])
+    if not user:
+        return 'User not found', 404
+
+    import csv, io
+    expenses = Expense.query.filter_by(
+        user_id=data['user_id']
+    ).order_by(Expense.date.desc()).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Date', 'Category', 'Description', 'Amount'])
+    for e in expenses:
+        writer.writerow([
+            e.date.strftime('%Y-%m-%d'),
+            e.category,
+            e.description or '',
+            e.amount,
+        ])
+    output.seek(0)
+    return send_file(
+        io.BytesIO(output.getvalue().encode()),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name='expenses.csv',
+    )
+
 
 # ── Budget Validation API ─────────────────────────────────────────────────────
 
@@ -435,7 +521,6 @@ def api_add_expense():
 
         if not amount:
             return jsonify({'success': False, 'error': 'Amount is required'}), 400
-
         try:
             amount = float(amount)
             if amount <= 0:
@@ -453,14 +538,12 @@ def api_add_expense():
         db.session.commit()
 
         budget_status = check_budget_status(current_user.id, category)
-
         return jsonify({
             'success':       True,
             'expense_id':    expense.id,
             'message':       f'Expense of ₹{amount} added to {category}',
             'budget_status': budget_status,
         }), 201
-
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -495,12 +578,9 @@ def api_all_budgets_status():
         return jsonify({'error': str(e)}), 500
 
 
-# ── Date Range Filter API (Feature 2) ─────────────────────────────────────────
-
 @app.route('/api/expenses/filter', methods=['GET'])
 @login_required
 def api_filter_expenses():
-    """Filter expenses by date range and optional category."""
     from_date_str = request.args.get('from_date')
     to_date_str   = request.args.get('to_date')
     category      = request.args.get('category')
@@ -543,8 +623,6 @@ def api_filter_expenses():
     }), 200
 
 
-# ── Custom Categories API (Feature 1) ─────────────────────────────────────────
-
 @app.route('/api/categories', methods=['GET'])
 @login_required
 def api_get_categories():
@@ -563,7 +641,6 @@ def api_create_category():
         return jsonify({'success': False, 'error': 'Category name is required'}), 400
     if len(name) > 100:
         return jsonify({'success': False, 'error': 'Name too long (max 100 chars)'}), 400
-
     if UserCategory.query.filter_by(user_id=current_user.id, name=name).first():
         return jsonify({'success': False, 'error': f'"{name}" already exists'}), 409
 
@@ -583,7 +660,6 @@ def api_delete_category(cat_id):
     db.session.commit()
     return jsonify({'success': True, 'message': f'"{cat.name}" deleted'}), 200
 
-# MOBILE APP API ROUTES ─────────────────────────────────────────
 
 @app.route('/api/auth/login', methods=['POST'])
 def api_auth_login():
@@ -646,7 +722,6 @@ def api_dashboard():
 
     total     = sum(e.amount for e in expenses)
     remaining = (current_user.monthly_salary or 0) - total
-
     breakdown = {}
     for e in expenses:
         breakdown[e.category] = breakdown.get(e.category, 0) + e.amount
@@ -655,6 +730,7 @@ def api_dashboard():
         'total':     total,
         'remaining': remaining,
         'breakdown': breakdown,
+        'salary':    current_user.monthly_salary or 0,
         'expenses':  [{
             'id':          e.id,
             'amount':      e.amount,
@@ -726,9 +802,9 @@ def api_get_budgets():
 @app.route('/api/budgets/<int:budget_id>', methods=['PATCH', 'PUT'])
 @login_required
 def api_update_budget(budget_id):
-    data = request.get_json() or {}
+    data  = request.get_json() or {}
     limit = data.get('limit_amount')
-    b = Budget.query.filter_by(id=budget_id, user_id=current_user.id).first()
+    b     = Budget.query.filter_by(id=budget_id, user_id=current_user.id).first()
     if not b:
         return jsonify({'success': False, 'error': 'Budget not found'}), 404
     try:
@@ -757,19 +833,19 @@ def api_delete_budget(budget_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
-    
-# ── PDF Export API (mobile) ───────────────────────────────────────────────────
+
+
 @app.route('/api/export/pdf', methods=['GET'])
 @login_required
 def api_export_pdf():
-    today = datetime.utcnow()
+    today         = datetime.utcnow()
     from_date_str = request.args.get('from_date')
     to_date_str   = request.args.get('to_date')
 
     try:
         from_date = datetime.strptime(from_date_str, '%Y-%m-%d') \
             if from_date_str else datetime(today.year, today.month, 1)
-        to_date = datetime.strptime(to_date_str, '%Y-%m-%d').replace(
+        to_date   = datetime.strptime(to_date_str, '%Y-%m-%d').replace(
             hour=23, minute=59, second=59) \
             if to_date_str else today
     except ValueError:
@@ -789,48 +865,9 @@ def api_export_pdf():
         to_date   = to_date,
         salary    = current_user.monthly_salary or 0,
     )
-
     filename = f'expenses_{from_date.strftime("%Y%m%d")}_{to_date.strftime("%Y%m%d")}.pdf'
-    return send_file(
-        buf,
-        mimetype='application/pdf',
-        as_attachment=True,
-        download_name=filename,
-    )
-
-import secrets
-download_tokens = {}
-
-@app.route('/generate-download-token')
-@login_required
-def generate_download_token():
-    token = secrets.token_urlsafe(32)
-    download_tokens[token] = current_user.id
-    return jsonify({'token': token})
-
-@app.route('/export/pdf-token/<token>')
-def export_pdf_token(token):
-    user_id = download_tokens.pop(token, None)
-    if not user_id:
-        return 'Invalid or expired token', 403
-    # Copy your existing export_pdf logic here but use user_id instead of current_user.id
-    from flask_login import login_user
-    user = User.query.get(user_id)
-    if not user:
-        return 'User not found', 404
-    login_user(user)
-    return export_pdf()
-
-@app.route('/export/csv-token/<token>')
-def export_csv_token(token):
-    user_id = download_tokens.pop(token, None)
-    if not user_id:
-        return 'Invalid or expired token', 403
-    user = User.query.get(user_id)
-    if not user:
-        return 'User not found', 404
-    login_user(user)
-    return export_csv()
+    return send_file(buf, mimetype='application/pdf',
+                     as_attachment=True, download_name=filename)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -838,4 +875,4 @@ def export_csv_token(token):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(host='0.0.0.0', port=5000,debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
