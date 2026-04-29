@@ -42,7 +42,6 @@ dependencies:
   shared_preferences: ^2.3.1  # persists session cookie across app restarts
   provider: ^6.1.2   
   dio: ^5.4.0         # for AuthService as ChangeNotifier 
-  device_info_plus: ^13.1.0
   cupertino_icons: ^1.0.8
 
   # The following adds the Cupertino Icons font to your application.
