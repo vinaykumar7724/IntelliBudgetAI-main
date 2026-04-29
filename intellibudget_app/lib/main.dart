@@ -1,12 +1,11 @@
-import 'dart:io';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:open_file/open_file.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
-import 'package:dio/dio.dart';
-import 'package:open_filex/open_filex.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -35,6 +34,8 @@ class _BudgetWebViewState extends State<BudgetWebView> {
   late final WebViewController _controller;
   final SpeechToText _speech = SpeechToText();
   bool _isLoading = true;
+  bool _isDownloading = false;
+  String _downloadMsg = '';
 
   @override
   void initState() {
@@ -47,26 +48,16 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onWebResourceError: (_) => setState(() => _isLoading = false),
         onNavigationRequest: (NavigationRequest request) async {
           final url = request.url;
-
-          if (url.contains('/export/pdf') || url.contains('.pdf')) {
-            final apiUrl = url.contains('/api/export/pdf')
-                ? url
-                : url.replaceFirst('/export/pdf', '/api/export/pdf');
-            await _downloadFile(apiUrl, 'budget_report.pdf', 'application/pdf');
+          if (url.contains('/export')) {
+            _downloadFile(url);
             return NavigationDecision.prevent;
           }
-
-          if (url.contains('/export/csv') || url.contains('.csv')) {
-            await _downloadFile(url, 'budget_report.csv', 'text/csv');
-            return NavigationDecision.prevent;
-          }
-
           return NavigationDecision.navigate;
         },
       ))
       ..addJavaScriptChannel(
         'FlutterSpeech',
-        onMessageReceived: (JavaScriptMessage msg) async {
+        onMessageReceived: (msg) async {
           if (msg.message == 'start') {
             await _startListening();
           } else if (msg.message == 'stop') {
@@ -78,78 +69,79 @@ class _BudgetWebViewState extends State<BudgetWebView> {
           'https://intellibudgetai-main-production.up.railway.app'));
 
     if (_controller.platform is AndroidWebViewController) {
-      final androidController =
-          _controller.platform as AndroidWebViewController;
-      androidController.setMediaPlaybackRequiresUserGesture(false);
-      androidController.setOnShowFileSelector((_) async => []);
+      (_controller.platform as AndroidWebViewController)
+          .setMediaPlaybackRequiresUserGesture(false);
     }
   }
 
-  Future<void> _downloadFile(
-      String url, String fileName, String mime) async {
+  Future<void> _downloadFile(String url) async {
+    final status = await Permission.storage.request();
+    if (!status.isGranted) {
+      _showMsg('❌ Storage permission denied');
+      return;
+    }
+
+    setState(() {
+      _isDownloading = true;
+      _downloadMsg = '⬇️ Downloading...';
+    });
+
     try {
-      if (Platform.isAndroid) {
-        final status = await Permission.storage.request();
-        if (!status.isGranted) {
-          debugPrint('DEBUG: Storage permission denied');
-          return;
-        }
-      }
+      final isPdf = url.contains('pdf');
+      final fileName = isPdf
+          ? 'IntelliBudget_Report.pdf'
+          : 'IntelliBudget_Export.csv';
 
-      String cookieHeader = '';
-      try {
-        final result = await _controller.runJavaScriptReturningResult(
-          'document.cookie',
-        );
-        cookieHeader = result.toString().replaceAll('"', '');
-        debugPrint('DEBUG: Cookies = $cookieHeader');
-      } catch (e) {
-        debugPrint('DEBUG: Cookie fetch failed = $e');
-      }
+      final dir = await getExternalStorageDirectory();
+      final savePath = '${dir!.path}/$fileName';
 
-      debugPrint('DEBUG: Downloading URL = $url');
+      final cookieResult = await _controller
+          .runJavaScriptReturningResult('document.cookie');
+      final cookieHeader = cookieResult.toString().replaceAll('"', '');
 
       final dio = Dio();
-      final response = await dio.get(
+      await dio.download(
         url,
+        savePath,
         options: Options(
+          headers: {'Cookie': cookieHeader},
           responseType: ResponseType.bytes,
-          followRedirects: true,
-          headers: {
-            if (cookieHeader.isNotEmpty) 'Cookie': cookieHeader,
-            'Accept': mime,
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-          validateStatus: (s) => s != null && s < 500,
         ),
+        onReceiveProgress: (received, total) {
+          if (total != -1) {
+            final progress = (received / total * 100).toStringAsFixed(0);
+            setState(() => _downloadMsg = '⬇️ Downloading... $progress%');
+          }
+        },
       );
 
-      debugPrint('DEBUG: Status = ${response.statusCode}');
-      debugPrint('DEBUG: Content-Type = ${response.headers.value('content-type')}');
-      debugPrint('DEBUG: Content-Length = ${response.headers.value('content-length')}');
+      setState(() {
+        _isDownloading = false;
+        _downloadMsg = '✅ Saved: $fileName';
+      });
 
-      final contentType = response.headers.value('content-type') ?? '';
-      if (contentType.contains('text/html')) {
-        debugPrint('DEBUG: Got HTML — not authenticated or wrong URL');
-        await _controller.reload();
-        return;
-      }
+      await OpenFile.open(savePath);
 
-      final dir = await getApplicationDocumentsDirectory();
-      final filePath = '${dir.path}/$fileName';
-      final file = File(filePath);
-      await file.writeAsBytes(response.data as List<int>);
-      debugPrint('DEBUG: File saved = $filePath');
-
-      final openResult = await OpenFilex.open(filePath);
-      debugPrint('DEBUG: OpenFilex result = ${openResult.type} ${openResult.message}');
+      Future.delayed(const Duration(seconds: 3), () {
+        if (mounted) setState(() => _downloadMsg = '');
+      });
     } catch (e) {
-      debugPrint('DEBUG ERROR: $e');
+      setState(() {
+        _isDownloading = false;
+        _downloadMsg = '❌ Download failed';
+      });
     }
+  }
+
+  void _showMsg(String msg) {
+    setState(() => _downloadMsg = msg);
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _downloadMsg = '');
+    });
   }
 
   Future<void> _startListening() async {
-    final bool available = await _speech.initialize(
+    bool available = await _speech.initialize(
       onError: (error) {
         _controller.runJavaScript(
             "window.onSpeechError('${error.errorMsg}')");
@@ -183,7 +175,7 @@ class _BudgetWebViewState extends State<BudgetWebView> {
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false,
-      onPopInvokedWithResult: (bool didPop, dynamic result) async {
+      onPopInvokedWithResult: (didPop, result) async {
         if (await _controller.canGoBack()) {
           _controller.goBack();
         }
@@ -204,6 +196,41 @@ class _BudgetWebViewState extends State<BudgetWebView> {
                       SizedBox(height: 12),
                       Text('Loading IntelliBudget AI...'),
                     ],
+                  ),
+                ),
+              if (_downloadMsg.isNotEmpty)
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: Container(
+                    color: _downloadMsg.contains('✅')
+                        ? Colors.green
+                        : _downloadMsg.contains('❌')
+                            ? Colors.red
+                            : const Color(0xFF6C63FF),
+                    padding: const EdgeInsets.symmetric(
+                        vertical: 12, horizontal: 16),
+                    child: Row(
+                      children: [
+                        if (_isDownloading)
+                          const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          ),
+                        if (_isDownloading) const SizedBox(width: 10),
+                        Text(
+                          _downloadMsg,
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
             ],
