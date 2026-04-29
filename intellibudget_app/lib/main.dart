@@ -11,7 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  if (Platform.isAndroid) {
+  if (!kIsWeb && Platform.isAndroid) {
     WebViewPlatform.instance = AndroidWebViewPlatform();
   }
   runApp(const MyApp());
