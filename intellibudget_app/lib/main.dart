@@ -38,6 +38,9 @@ class _BudgetWebViewState extends State<BudgetWebView> {
   bool _isDownloading = false;
   String _downloadMsg = '';
 
+  static const String _baseUrl =
+      'https://intellibudgetai-main-production.up.railway.app';
+
   @override
   void initState() {
     super.initState();
@@ -66,8 +69,7 @@ class _BudgetWebViewState extends State<BudgetWebView> {
           }
         },
       )
-      ..loadRequest(Uri.parse(
-          'https://intellibudgetai-main-production.up.railway.app'));
+      ..loadRequest(Uri.parse(_baseUrl));
 
     if (_controller.platform is AndroidWebViewController) {
       (_controller.platform as AndroidWebViewController)
@@ -92,24 +94,28 @@ class _BudgetWebViewState extends State<BudgetWebView> {
 
     setState(() {
       _isDownloading = true;
-      _downloadMsg = '⬇️ Downloading...';
+      _downloadMsg = '⬇️ Preparing download...';
     });
 
     try {
       final isPdf = url.contains('pdf');
-      final fileName = isPdf
-          ? 'IntelliBudget_Report.pdf'
-          : 'IntelliBudget_Export.csv';
+      final fileName =
+          isPdf ? 'IntelliBudget_Report.pdf' : 'IntelliBudget_Export.csv';
 
       final dir = await getExternalStorageDirectory();
       final savePath = '${dir!.path}/$fileName';
 
-      // Step 1: Generate one-time token via browser session (JS fetch)
-      final tokenResult = await _controller.runJavaScriptReturningResult('''
+      // Step 1: Get one-time token via JS fetch (uses browser session)
+      final tokenResult =
+          await _controller.runJavaScriptReturningResult('''
         (async () => {
           try {
-            const r = await fetch('/generate-download-token');
-            const d = await r.json();
+            const params = new URLSearchParams(window.location.search);
+            const from = params.get('from_date') || '';
+            const to   = params.get('to_date') || '';
+            const url  = '/generate-download-token?from_date=' + from + '&to_date=' + to;
+            const r    = await fetch(url, { credentials: 'include' });
+            const d    = await r.json();
             return d.token || '';
           } catch(e) {
             return '';
@@ -117,7 +123,8 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         })()
       ''');
 
-      final token = tokenResult.toString().replaceAll('"', '').trim();
+      final token =
+          tokenResult.toString().replaceAll('"', '').trim();
 
       if (token.isEmpty) {
         _showMsg('❌ Session expired — please login again');
@@ -125,12 +132,12 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         return;
       }
 
-      // Step 2: Download file using token (no cookie needed)
-      const baseUrl =
-          'https://intellibudgetai-main-production.up.railway.app';
+      // Step 2: Download using token (no cookie needed)
       final downloadUrl = isPdf
-          ? '$baseUrl/export/pdf-token/$token'
-          : '$baseUrl/export/csv-token/$token';
+          ? '$_baseUrl/export/pdf-token/$token'
+          : '$_baseUrl/export/csv-token/$token';
+
+      setState(() => _downloadMsg = '⬇️ Downloading...');
 
       final dio = Dio();
       final response = await dio.get(
@@ -142,7 +149,9 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         ),
       );
 
-      final contentType = response.headers['content-type']?.first ?? '';
+      // Verify we got actual file not HTML error page
+      final contentType =
+          response.headers['content-type']?.first ?? '';
       if (contentType.contains('text/html')) {
         _showMsg('❌ Download failed — try again');
         setState(() => _isDownloading = false);
@@ -180,8 +189,8 @@ class _BudgetWebViewState extends State<BudgetWebView> {
   Future<void> _startListening() async {
     bool available = await _speech.initialize(
       onError: (error) {
-        _controller.runJavaScript(
-            "window.onSpeechError('${error.errorMsg}')");
+        _controller
+            .runJavaScript("window.onSpeechError('${error.errorMsg}')");
       },
     );
 
@@ -229,7 +238,8 @@ class _BudgetWebViewState extends State<BudgetWebView> {
                     children: [
                       Text('💰', style: TextStyle(fontSize: 48)),
                       SizedBox(height: 16),
-                      CircularProgressIndicator(color: Color(0xFF6C63FF)),
+                      CircularProgressIndicator(
+                          color: Color(0xFF6C63FF)),
                       SizedBox(height: 12),
                       Text('Loading IntelliBudget AI...'),
                     ],
@@ -259,7 +269,8 @@ class _BudgetWebViewState extends State<BudgetWebView> {
                               strokeWidth: 2,
                             ),
                           ),
-                        if (_isDownloading) const SizedBox(width: 10),
+                        if (_isDownloading)
+                          const SizedBox(width: 10),
                         Text(
                           _downloadMsg,
                           style: const TextStyle(
