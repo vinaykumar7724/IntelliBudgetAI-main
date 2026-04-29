@@ -77,15 +77,10 @@ class _BudgetWebViewState extends State<BudgetWebView> {
 
   Future<bool> _requestStoragePermission() async {
     if (!Platform.isAndroid) return true;
-
-    // Try manage external storage first (Android 11+)
-   var status = await Permission.manageExternalStorage.request();
-   if (status.isGranted) return true;
-  
-   // Fallback to regular storage (Android 10 and below)
-   status = await Permission.storage.request();
-   return status.isGranted;
-    
+    var status = await Permission.manageExternalStorage.request();
+    if (status.isGranted) return true;
+    status = await Permission.storage.request();
+    return status.isGranted;
   }
 
   Future<void> _downloadFile(String url) async {
@@ -109,25 +104,38 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       final dir = await getExternalStorageDirectory();
       final savePath = '${dir!.path}/$fileName';
 
+      // Get cookies from WebView
       final cookieResult = await _controller
           .runJavaScriptReturningResult('document.cookie');
-      final cookieHeader = cookieResult.toString().replaceAll('"', '');
+      String cookieHeader = cookieResult.toString();
+      if (cookieHeader.startsWith('"')) {
+        cookieHeader = cookieHeader.substring(1, cookieHeader.length - 1);
+      }
 
       final dio = Dio();
-      await dio.download(
+      final response = await dio.get(
         url,
-        savePath,
         options: Options(
-          headers: {'Cookie': cookieHeader},
+          headers: {
+            'Cookie': cookieHeader,
+            'Accept': isPdf ? 'application/pdf' : 'text/csv',
+          },
           responseType: ResponseType.bytes,
+          followRedirects: true,
+          validateStatus: (status) => status! < 500,
         ),
-        onReceiveProgress: (received, total) {
-          if (total != -1) {
-            final progress = (received / total * 100).toStringAsFixed(0);
-            setState(() => _downloadMsg = '⬇️ Downloading... $progress%');
-          }
-        },
       );
+
+      // Check if server returned HTML instead of file (session expired)
+      final contentType = response.headers['content-type']?.first ?? '';
+      if (contentType.contains('text/html')) {
+        _showMsg('❌ Session expired — please login again');
+        setState(() => _isDownloading = false);
+        return;
+      }
+
+      final file = File(savePath);
+      await file.writeAsBytes(response.data);
 
       setState(() {
         _isDownloading = false;
