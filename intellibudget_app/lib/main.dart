@@ -1,8 +1,8 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
-import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
@@ -46,21 +46,27 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onPageFinished: (_) => setState(() => _isLoading = false),
         onWebResourceError: (_) => setState(() => _isLoading = false),
         onNavigationRequest: (NavigationRequest request) async {
-         final url = request.url;
-         if (url.contains('/export/pdf') || url.contains('.pdf')) {
-           await _downloadFile(url, 'budget_report.pdf', 'application/pdf');
-           return NavigationDecision.prevent;
-        }
-       if (url.contains('/export/csv') || url.contains('.csv')) {
-         await _downloadFile(url, 'budget_report.csv', 'text/csv');
-         return NavigationDecision.prevent;
-     }
-     return NavigationDecision.navigate;
-    },
+          final url = request.url;
+
+          if (url.contains('/export/pdf') || url.contains('.pdf')) {
+            final apiUrl = url.contains('/api/export/pdf')
+                ? url
+                : url.replaceFirst('/export/pdf', '/api/export/pdf');
+            await _downloadFile(apiUrl, 'budget_report.pdf', 'application/pdf');
+            return NavigationDecision.prevent;
+          }
+
+          if (url.contains('/export/csv') || url.contains('.csv')) {
+            await _downloadFile(url, 'budget_report.csv', 'text/csv');
+            return NavigationDecision.prevent;
+          }
+
+          return NavigationDecision.navigate;
+        },
       ))
       ..addJavaScriptChannel(
         'FlutterSpeech',
-        onMessageReceived: (msg) async {
+        onMessageReceived: (JavaScriptMessage msg) async {
           if (msg.message == 'start') {
             await _startListening();
           } else if (msg.message == 'stop') {
@@ -75,53 +81,75 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       final androidController =
           _controller.platform as AndroidWebViewController;
       androidController.setMediaPlaybackRequiresUserGesture(false);
-
-      // Handle file downloads (PDF, CSV)
       androidController.setOnShowFileSelector((_) async => []);
     }
   }
-Future<void> _downloadFile(String url, String fileName, String mime) async {
-  try {
-    if (Platform.isAndroid) {
-      final status = await Permission.storage.request();
-      if (!status.isGranted) return;
+
+  Future<void> _downloadFile(
+      String url, String fileName, String mime) async {
+    try {
+      if (Platform.isAndroid) {
+        final status = await Permission.storage.request();
+        if (!status.isGranted) {
+          debugPrint('DEBUG: Storage permission denied');
+          return;
+        }
+      }
+
+      String cookieHeader = '';
+      try {
+        final result = await _controller.runJavaScriptReturningResult(
+          'document.cookie',
+        );
+        cookieHeader = result.toString().replaceAll('"', '');
+        debugPrint('DEBUG: Cookies = $cookieHeader');
+      } catch (e) {
+        debugPrint('DEBUG: Cookie fetch failed = $e');
+      }
+
+      debugPrint('DEBUG: Downloading URL = $url');
+
+      final dio = Dio();
+      final response = await dio.get(
+        url,
+        options: Options(
+          responseType: ResponseType.bytes,
+          followRedirects: true,
+          headers: {
+            if (cookieHeader.isNotEmpty) 'Cookie': cookieHeader,
+            'Accept': mime,
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          validateStatus: (s) => s != null && s < 500,
+        ),
+      );
+
+      debugPrint('DEBUG: Status = ${response.statusCode}');
+      debugPrint('DEBUG: Content-Type = ${response.headers.value('content-type')}');
+      debugPrint('DEBUG: Content-Length = ${response.headers.value('content-length')}');
+
+      final contentType = response.headers.value('content-type') ?? '';
+      if (contentType.contains('text/html')) {
+        debugPrint('DEBUG: Got HTML — not authenticated or wrong URL');
+        await _controller.reload();
+        return;
+      }
+
+      final dir = await getApplicationDocumentsDirectory();
+      final filePath = '${dir.path}/$fileName';
+      final file = File(filePath);
+      await file.writeAsBytes(response.data as List<int>);
+      debugPrint('DEBUG: File saved = $filePath');
+
+      final openResult = await OpenFilex.open(filePath);
+      debugPrint('DEBUG: OpenFilex result = ${openResult.type} ${openResult.message}');
+    } catch (e) {
+      debugPrint('DEBUG ERROR: $e');
     }
-
-    // Grab cookies from WebView session
-    String cookieHeader = '';
-if (_controller.platform is AndroidWebViewController) {
-  final androidController = _controller.platform as AndroidWebViewController;
-  cookieHeader = await _controller.runJavaScriptReturningResult(
-    'document.cookie'
-  ) as String;
-  // strip surrounding quotes JS returns
-  cookieHeader = cookieHeader.replaceAll('"', '');
-}
-    final dir = await getApplicationDocumentsDirectory();
-    final filePath = '${dir.path}/$fileName';
-
-    final dio = Dio();
-    await dio.download(
-      url,
-      filePath,
-      options: Options(
-        responseType: ResponseType.bytes,
-        headers: {
-          'Cookie': cookieHeader,
-          'Accept': mime,
-        },
-        followRedirects: false,
-        validateStatus: (s) => s != null && s < 400,
-      ),
-    );
-
-    await OpenFilex.open(filePath);
-  } catch (e) {
-    debugPrint('Download error: $e');
   }
-}
+
   Future<void> _startListening() async {
-    bool available = await _speech.initialize(
+    final bool available = await _speech.initialize(
       onError: (error) {
         _controller.runJavaScript(
             "window.onSpeechError('${error.errorMsg}')");
@@ -155,7 +183,7 @@ if (_controller.platform is AndroidWebViewController) {
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false,
-      onPopInvokedWithResult: (didPop, result) async {
+      onPopInvokedWithResult: (bool didPop, dynamic result) async {
         if (await _controller.canGoBack()) {
           _controller.goBack();
         }
