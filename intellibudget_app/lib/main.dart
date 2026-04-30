@@ -50,9 +50,10 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onPageStarted: (_) => setState(() => _isLoading = true),
         onPageFinished: (_) => setState(() => _isLoading = false),
         onWebResourceError: (_) => setState(() => _isLoading = false),
-        onNavigationRequest: (NavigationRequest request) async {
+        onNavigationRequest: (NavigationRequest request) {
           final url = request.url;
-          if (url.contains('/export')) {
+          // Intercept ALL export URLs — prevent browser/webview from handling
+          if (url.contains('/export') || url.contains('download')) {
             _downloadFile(url);
             return NavigationDecision.prevent;
           }
@@ -77,12 +78,46 @@ class _BudgetWebViewState extends State<BudgetWebView> {
     }
   }
 
+  // ── Permission: only ask WRITE on Android <= 9 (API 28) ──────────────────
   Future<bool> _requestStoragePermission() async {
     if (!Platform.isAndroid) return true;
-    var status = await Permission.manageExternalStorage.request();
-    if (status.isGranted) return true;
-    status = await Permission.storage.request();
-    return status.isGranted;
+
+    // Android 10+ (API 29+): app-specific dirs need NO permission
+    // Android 9 and below: need WRITE_EXTERNAL_STORAGE
+    final androidInfo = await _getAndroidSdkInt();
+    if (androidInfo <= 28) {
+      final status = await Permission.storage.request();
+      return status.isGranted;
+    }
+    return true;
+  }
+
+  Future<int> _getAndroidSdkInt() async {
+    try {
+      // Read SDK version from system property via dart:io
+      final result = await Process.run('getprop', ['ro.build.version.sdk']);
+      return int.tryParse(result.stdout.toString().trim()) ?? 29;
+    } catch (_) {
+      return 29; // assume modern, no permission needed
+    }
+  }
+
+  // ── Get save directory — reliable across all Android versions ─────────────
+  Future<String> _getSaveDir() async {
+    try {
+      // Primary: app documents dir (no permission needed, survives uninstall)
+      final dir = await getApplicationDocumentsDirectory();
+      return dir.path;
+    } catch (_) {
+      try {
+        // Fallback: temp dir
+        final dir = await getTemporaryDirectory();
+        return dir.path;
+      } catch (_) {
+        // Last resort
+        return '/data/local/tmp';
+      }
+    }
   }
 
   Future<void> _downloadFile(String url) async {
@@ -99,23 +134,26 @@ class _BudgetWebViewState extends State<BudgetWebView> {
 
     try {
       final isPdf = url.contains('pdf');
+      final ext = isPdf ? 'pdf' : 'csv';
       final fileName =
-          isPdf ? 'IntelliBudget_Report.pdf' : 'IntelliBudget_Export.csv';
+          'IntelliBudget_${DateTime.now().millisecondsSinceEpoch}.$ext';
 
-      final dir = await getExternalStorageDirectory();
-      final savePath = '${dir!.path}/$fileName';
+      final saveDir = await _getSaveDir();
+      final savePath = '$saveDir/$fileName';
 
-      // Step 1: Get one-time token via JS fetch (uses browser session)
-      final tokenResult =
-          await _controller.runJavaScriptReturningResult('''
+      // Step 1: Get one-time token via JS (uses existing browser session cookie)
+      final tokenResult = await _controller.runJavaScriptReturningResult('''
         (async () => {
           try {
             const params = new URLSearchParams(window.location.search);
             const from = params.get('from_date') || '';
-            const to   = params.get('to_date') || '';
-            const url  = '/generate-download-token?from_date=' + from + '&to_date=' + to;
-            const r    = await fetch(url, { credentials: 'include' });
-            const d    = await r.json();
+            const to   = params.get('to_date')   || '';
+            const r    = await fetch(
+              '/generate-download-token?from_date=' + from + '&to_date=' + to,
+              { credentials: 'include' }
+            );
+            if (!r.ok) return '';
+            const d = await r.json();
             return d.token || '';
           } catch(e) {
             return '';
@@ -123,8 +161,7 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         })()
       ''');
 
-      final token =
-          tokenResult.toString().replaceAll('"', '').trim();
+      final token = tokenResult.toString().replaceAll('"', '').trim();
 
       if (token.isEmpty) {
         _showMsg('❌ Session expired — please login again');
@@ -132,7 +169,7 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         return;
       }
 
-      // Step 2: Download using token (no cookie needed)
+      // Step 2: Download via token (no cookie/session needed)
       final downloadUrl = isPdf
           ? '$_baseUrl/export/pdf-token/$token'
           : '$_baseUrl/export/csv-token/$token';
@@ -140,47 +177,89 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       setState(() => _downloadMsg = '⬇️ Downloading...');
 
       final dio = Dio();
-      final response = await dio.get(
+      final response = await dio.download(
         downloadUrl,
+        savePath,
         options: Options(
           responseType: ResponseType.bytes,
           followRedirects: true,
-          validateStatus: (status) => status! < 500,
+          validateStatus: (status) => status != null && status < 500,
+          receiveTimeout: const Duration(seconds: 30),
+          sendTimeout: const Duration(seconds: 10),
         ),
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            final pct = (received / total * 100).toStringAsFixed(0);
+            if (mounted) {
+              setState(() => _downloadMsg = '⬇️ Downloading... $pct%');
+            }
+          }
+        },
       );
 
-      // Verify we got actual file not HTML error page
-      final contentType =
-          response.headers['content-type']?.first ?? '';
-      if (contentType.contains('text/html')) {
-        _showMsg('❌ Download failed — try again');
+      // Verify not an HTML error page
+      final file = File(savePath);
+      if (!await file.exists() || await file.length() < 100) {
+        _showMsg('❌ Download failed — file empty');
         setState(() => _isDownloading = false);
         return;
       }
 
-      final file = File(savePath);
-      await file.writeAsBytes(response.data);
+      // For PDF: verify PDF header magic bytes
+      if (isPdf) {
+        final header = await file.openRead(0, 5).first;
+        final isPdfFile = String.fromCharCodes(header).startsWith('%PDF');
+        if (!isPdfFile) {
+          await file.delete();
+          _showMsg('❌ Download failed — invalid file received');
+          setState(() => _isDownloading = false);
+          return;
+        }
+      }
 
       setState(() {
         _isDownloading = false;
-        _downloadMsg = '✅ Saved: $fileName';
+        _downloadMsg = '✅ Downloaded! Opening...';
       });
 
-      await OpenFilex.open(savePath);
+      // Open in-app using system PDF/CSV viewer
+      final result = await OpenFilex.open(savePath);
 
+      if (result.type == ResultType.noAppToOpen) {
+        _showMsg('✅ Saved to: $fileName (no viewer installed)');
+      } else if (result.type == ResultType.done) {
+        _showMsg('✅ Opened: $fileName');
+      } else {
+        _showMsg('✅ Saved: $fileName');
+      }
+
+      Future.delayed(const Duration(seconds: 4), () {
+        if (mounted) setState(() => _downloadMsg = '');
+      });
+    } on DioException catch (e) {
+      setState(() {
+        _isDownloading = false;
+        _downloadMsg = '❌ Network error: ${e.message ?? 'check connection'}';
+      });
       Future.delayed(const Duration(seconds: 3), () {
         if (mounted) setState(() => _downloadMsg = '');
       });
     } catch (e) {
       setState(() {
         _isDownloading = false;
-        _downloadMsg = '❌ Download failed';
+        _downloadMsg = '❌ Download failed: ${e.toString().split('\n').first}';
+      });
+      Future.delayed(const Duration(seconds: 3), () {
+        if (mounted) setState(() => _downloadMsg = '');
       });
     }
   }
 
   void _showMsg(String msg) {
-    setState(() => _downloadMsg = msg);
+    setState(() {
+      _isDownloading = false;
+      _downloadMsg = msg;
+    });
     Future.delayed(const Duration(seconds: 3), () {
       if (mounted) setState(() => _downloadMsg = '');
     });
@@ -208,8 +287,8 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         localeId: 'en_IN',
       );
     } else {
-      _controller.runJavaScript(
-          "window.onSpeechError('Microphone not available')");
+      _controller
+          .runJavaScript("window.onSpeechError('Microphone not available')");
     }
   }
 
@@ -238,8 +317,7 @@ class _BudgetWebViewState extends State<BudgetWebView> {
                     children: [
                       Text('💰', style: TextStyle(fontSize: 48)),
                       SizedBox(height: 16),
-                      CircularProgressIndicator(
-                          color: Color(0xFF6C63FF)),
+                      CircularProgressIndicator(color: Color(0xFF6C63FF)),
                       SizedBox(height: 12),
                       Text('Loading IntelliBudget AI...'),
                     ],
@@ -269,13 +347,14 @@ class _BudgetWebViewState extends State<BudgetWebView> {
                               strokeWidth: 2,
                             ),
                           ),
-                        if (_isDownloading)
-                          const SizedBox(width: 10),
-                        Text(
-                          _downloadMsg,
-                          style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold),
+                        if (_isDownloading) const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            _downloadMsg,
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold),
+                          ),
                         ),
                       ],
                     ),
