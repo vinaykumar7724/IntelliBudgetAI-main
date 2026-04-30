@@ -1,5 +1,5 @@
+import 'dart:convert';
 import 'dart:io';
-import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
@@ -53,7 +53,7 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         onNavigationRequest: (NavigationRequest request) {
           final url = request.url;
           if (url.contains('/export')) {
-            _downloadFile(url);
+            _triggerDownload(url);
             return NavigationDecision.prevent;
           }
           return NavigationDecision.navigate;
@@ -62,25 +62,14 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       ..addJavaScriptChannel(
         'FlutterSpeech',
         onMessageReceived: (msg) async {
-          if (msg.message == 'start') {
-            await _startListening();
-          } else if (msg.message == 'stop') {
-            await _stopListening();
-          }
+          if (msg.message == 'start') await _startListening();
+          if (msg.message == 'stop') await _stopListening();
         },
       )
-      // Channel to receive download request WITH cookie from JS side
+      // Receives: "OK|<base64>" or "ERR|<reason>"
       ..addJavaScriptChannel(
         'FlutterDownload',
-        onMessageReceived: (msg) {
-          // msg.message = "pdf|cookieString" or "csv|cookieString"
-          final parts = msg.message.split('|');
-          if (parts.length >= 2) {
-            final type = parts[0];
-            final cookie = parts.sublist(1).join('|'); // cookie may contain |
-            _downloadWithCookie(type, cookie);
-          }
-        },
+        onMessageReceived: (msg) => _handleDownloadMessage(msg.message),
       )
       ..loadRequest(Uri.parse(_baseUrl));
 
@@ -90,119 +79,112 @@ class _BudgetWebViewState extends State<BudgetWebView> {
     }
   }
 
-  // ── Intercept /export navigation → trigger JS to grab cookie + call back ──
-  Future<void> _downloadFile(String interceptedUrl) async {
+  // Step 1: intercept export nav → inject JS fetch inside WebView
+  Future<void> _triggerDownload(String interceptedUrl) async {
+    if (_isDownloading) return;
+    setState(() {
+      _isDownloading = true;
+      _downloadMsg = '⬇️ Fetching file...';
+    });
+
     final isPdf = interceptedUrl.contains('pdf');
     final type = isPdf ? 'pdf' : 'csv';
+    final accept = isPdf ? 'application/pdf' : 'text/csv';
 
-    // Inject JS: read document.cookie and send back via FlutterDownload channel
+    // Get date params from current page URL
+    String exportUrl = isPdf ? '/export/pdf' : '/export';
+    try {
+      final currentUrl = await _controller.currentUrl() ?? '';
+      final uri = Uri.parse(currentUrl);
+      final p = uri.queryParameters;
+      final params = <String>[];
+      if (p['from_date'] != null) params.add('from_date=${p['from_date']}');
+      if (p['to_date'] != null) params.add('to_date=${p['to_date']}');
+      if (params.isNotEmpty) exportUrl += '?${params.join('&')}';
+    } catch (_) {}
+
+    // JS fetch with credentials → converts bytes to base64 → posts to Flutter
+    // Uses Uint8Array → reduce approach to avoid btoa string size limits
     await _controller.runJavaScript('''
-      (function() {
-        var cookie = document.cookie || '';
-        FlutterDownload.postMessage('$type|' + cookie);
+      (async function() {
+        try {
+          const resp = await fetch('$exportUrl', {
+            credentials: 'include',
+            headers: { 'Accept': '$accept' }
+          });
+          if (!resp.ok) {
+            FlutterDownload.postMessage('ERR|status:' + resp.status);
+            return;
+          }
+          const ct = resp.headers.get('content-type') || '';
+          if (ct.includes('text/html')) {
+            FlutterDownload.postMessage('ERR|html');
+            return;
+          }
+          const buf = await resp.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          // Convert to base64 in chunks to avoid call stack overflow
+          let binary = '';
+          const chunkSize = 8192;
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+          }
+          const b64 = btoa(binary);
+          FlutterDownload.postMessage('$type|' + b64);
+        } catch(e) {
+          FlutterDownload.postMessage('ERR|' + e.toString());
+        }
       })();
     ''');
   }
 
-  // ── Actual download using cookie passed from JS ────────────────────────────
-  Future<void> _downloadWithCookie(String type, String cookie) async {
-    final granted = await _requestPermissionIfNeeded();
-    if (!granted) {
-      _showMsg('❌ Storage permission denied');
+  // Step 2: receive base64 from JS → decode → save → open
+  Future<void> _handleDownloadMessage(String message) async {
+    if (message.startsWith('ERR|')) {
+      final reason = message.substring(4);
+      if (reason.contains('html') || reason.contains('401') || reason.contains('403')) {
+        _showMsg('❌ Session expired — please login again');
+      } else {
+        _showMsg('❌ Download failed: $reason');
+      }
       return;
     }
 
-    setState(() {
-      _isDownloading = true;
-      _downloadMsg = '⬇️ Preparing download...';
-    });
+    final sep = message.indexOf('|');
+    if (sep < 0) {
+      _showMsg('❌ Invalid response');
+      return;
+    }
+
+    final type = message.substring(0, sep);
+    final b64 = message.substring(sep + 1);
+    final isPdf = type == 'pdf';
 
     try {
-      final isPdf = type == 'pdf';
-      final ext = isPdf ? 'pdf' : 'csv';
-      final ts = DateTime.now().millisecondsSinceEpoch;
-      final fileName = 'IntelliBudget_$ts.$ext';
+      setState(() => _downloadMsg = '⬇️ Saving file...');
 
-      final dir = await getApplicationDocumentsDirectory();
-      final savePath = '${dir.path}/$fileName';
+      // dart:convert base64 decode — correct and handles padding automatically
+      final bytes = base64Decode(b64);
 
-      // Get date params from current URL
-      final currentUrl = await _controller.currentUrl() ?? _baseUrl;
-      Map<String, String> dateParams = {};
-      try {
-        final uri = Uri.parse(currentUrl);
-        final p = uri.queryParameters;
-        if (p['from_date'] != null) dateParams['from_date'] = p['from_date']!;
-        if (p['to_date'] != null) dateParams['to_date'] = p['to_date']!;
-      } catch (_) {}
-
-      final downloadUri = isPdf
-          ? Uri.parse('$_baseUrl/export/pdf')
-              .replace(queryParameters: dateParams.isEmpty ? null : dateParams)
-          : Uri.parse('$_baseUrl/export');
-
-      // Flask session is HttpOnly — document.cookie won't have it.
-      // So we use JS fetch (which DOES send HttpOnly cookies automatically)
-      // and receive the file bytes via base64 back to Flutter.
-      setState(() => _downloadMsg = '⬇️ Downloading...');
-
-      final b64Result = await _controller.runJavaScriptReturningResult('''
-        (async function() {
-          try {
-            const url = '${downloadUri.toString()}';
-            const resp = await fetch(url, {
-              credentials: 'include',
-              headers: { 'Accept': '${isPdf ? 'application/pdf' : 'text/csv'}' }
-            });
-            if (!resp.ok) return 'ERROR:' + resp.status;
-            const ct = resp.headers.get('content-type') || '';
-            if (ct.includes('text/html')) return 'ERROR:html';
-            const buf = await resp.arrayBuffer();
-            const bytes = new Uint8Array(buf);
-            let binary = '';
-            for (let i = 0; i < bytes.byteLength; i++) {
-              binary += String.fromCharCode(bytes[i]);
-            }
-            return btoa(binary);
-          } catch(e) {
-            return 'ERROR:' + e.toString();
-          }
-        })()
-      ''');
-
-      final b64 = b64Result.toString().replaceAll('"', '').trim();
-
-      if (b64.startsWith('ERROR:')) {
-        final reason = b64.substring(6);
-        if (reason == 'html' || reason == '401' || reason == '302') {
-          _showMsg('❌ Session expired — please login again');
-        } else {
-          _showMsg('❌ Download failed: $reason');
-        }
-        setState(() => _isDownloading = false);
+      if (bytes.isEmpty) {
+        _showMsg('❌ Empty file received');
         return;
       }
 
-      if (b64.isEmpty) {
-        _showMsg('❌ Empty response from server');
-        setState(() => _isDownloading = false);
-        return;
-      }
-
-      // Decode base64 → bytes
-      final bytes = _base64ToBytes(b64);
-
-      // Verify PDF magic bytes
+      // Verify PDF magic bytes %PDF-
       if (isPdf && bytes.length > 4) {
         final magic = String.fromCharCodes(bytes.sublist(0, 5));
         if (!magic.startsWith('%PDF')) {
-          _showMsg('❌ Invalid PDF received');
-          setState(() => _isDownloading = false);
+          _showMsg('❌ Invalid PDF — server returned wrong content');
           return;
         }
       }
 
-      // Write file
+      final dir = await getApplicationDocumentsDirectory();
+      final ext = isPdf ? 'pdf' : 'csv';
+      final fileName = 'IntelliBudget_${DateTime.now().millisecondsSinceEpoch}.$ext';
+      final savePath = '${dir.path}/$fileName';
+
       await File(savePath).writeAsBytes(bytes, flush: true);
 
       setState(() {
@@ -210,51 +192,29 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         _downloadMsg = '✅ Downloaded! Opening...';
       });
 
-      final openResult = await OpenFilex.open(savePath);
-      if (openResult.type == ResultType.noAppToOpen) {
-        _showMsg('✅ Saved: $fileName\n(Install a PDF viewer to open)');
+      final result = await OpenFilex.open(savePath);
+      if (result.type == ResultType.noAppToOpen) {
+        _showMsg('✅ Saved: $fileName\n(Install PDF viewer to open)');
       } else {
-        _showMsg('✅ Opened: $fileName');
+        _showMsg('✅ Opened successfully');
       }
 
       Future.delayed(const Duration(seconds: 4), () {
         if (mounted) setState(() => _downloadMsg = '');
       });
-    } on DioException catch (e) {
-      _showMsg('❌ Network error: ${e.type.name}');
     } catch (e) {
-      _showMsg('❌ Error: ${e.toString().split('\n').first}');
+      _showMsg('❌ Decode error: ${e.toString().split('\n').first}');
     }
-  }
-
-  // ── Pure Dart base64 decode (no extra package) ────────────────────────────
-  List<int> _base64ToBytes(String b64) {
-    const chars =
-        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    final clean = b64.replaceAll(RegExp(r'[^A-Za-z0-9+/=]'), '');
-    final bytes = <int>[];
-    for (var i = 0; i < clean.length; i += 4) {
-      final a = chars.indexOf(clean[i]);
-      final b = chars.indexOf(clean[i + 1]);
-      final c = i + 2 < clean.length ? chars.indexOf(clean[i + 2]) : 0;
-      final d = i + 3 < clean.length ? chars.indexOf(clean[i + 3]) : 0;
-      bytes.add((a << 2) | (b >> 4));
-      if (c != -1 && clean[i + 2] != '=') bytes.add(((b & 0xF) << 4) | (c >> 2));
-      if (d != -1 && i + 3 < clean.length && clean[i + 3] != '=') {
-        bytes.add(((c & 0x3) << 6) | d);
-      }
-    }
-    return bytes;
   }
 
   Future<bool> _requestPermissionIfNeeded() async {
     if (!Platform.isAndroid) return true;
     try {
-      final result = await Process.run('getprop', ['ro.build.version.sdk']);
-      final sdk = int.tryParse(result.stdout.toString().trim()) ?? 29;
+      final r = await Process.run('getprop', ['ro.build.version.sdk']);
+      final sdk = int.tryParse(r.stdout.toString().trim()) ?? 29;
       if (sdk <= 28) {
-        final status = await Permission.storage.request();
-        return status.isGranted;
+        final s = await Permission.storage.request();
+        return s.isGranted;
       }
       return true;
     } catch (_) {
@@ -274,10 +234,8 @@ class _BudgetWebViewState extends State<BudgetWebView> {
 
   Future<void> _startListening() async {
     bool available = await _speech.initialize(
-      onError: (error) {
-        _controller
-            .runJavaScript("window.onSpeechError('${error.errorMsg}')");
-      },
+      onError: (e) =>
+          _controller.runJavaScript("window.onSpeechError('${e.errorMsg}')"),
     );
     if (available) {
       await _speech.listen(
@@ -293,23 +251,18 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         localeId: 'en_IN',
       );
     } else {
-      _controller
-          .runJavaScript("window.onSpeechError('Microphone not available')");
+      _controller.runJavaScript("window.onSpeechError('Microphone not available')");
     }
   }
 
-  Future<void> _stopListening() async {
-    await _speech.stop();
-  }
+  Future<void> _stopListening() async => _speech.stop();
 
   @override
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, result) async {
-        if (await _controller.canGoBack()) {
-          _controller.goBack();
-        }
+        if (await _controller.canGoBack()) _controller.goBack();
       },
       child: Scaffold(
         body: SafeArea(
