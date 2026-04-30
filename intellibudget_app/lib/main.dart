@@ -7,7 +7,6 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
-import 'package:webview_cookie_manager/webview_cookie_manager.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -35,7 +34,6 @@ class BudgetWebView extends StatefulWidget {
 class _BudgetWebViewState extends State<BudgetWebView> {
   late final WebViewController _controller;
   final SpeechToText _speech = SpeechToText();
-  final _cookieManager = WebviewCookieManager();
   bool _isLoading = true;
   bool _isDownloading = false;
   String _downloadMsg = '';
@@ -71,6 +69,19 @@ class _BudgetWebViewState extends State<BudgetWebView> {
           }
         },
       )
+      // Channel to receive download request WITH cookie from JS side
+      ..addJavaScriptChannel(
+        'FlutterDownload',
+        onMessageReceived: (msg) {
+          // msg.message = "pdf|cookieString" or "csv|cookieString"
+          final parts = msg.message.split('|');
+          if (parts.length >= 2) {
+            final type = parts[0];
+            final cookie = parts.sublist(1).join('|'); // cookie may contain |
+            _downloadWithCookie(type, cookie);
+          }
+        },
+      )
       ..loadRequest(Uri.parse(_baseUrl));
 
     if (_controller.platform is AndroidWebViewController) {
@@ -79,49 +90,22 @@ class _BudgetWebViewState extends State<BudgetWebView> {
     }
   }
 
-  // ── Extract session cookie string from WebView ────────────────────────────
-  Future<String?> _getSessionCookieHeader() async {
-    try {
-      final cookies = await _cookieManager.getCookies(_baseUrl);
-      if (cookies.isEmpty) return null;
-      return cookies.map((c) => '${c.name}=${c.value}').join('; ');
-    } catch (e) {
-      debugPrint('Cookie error: $e');
-      return null;
-    }
-  }
-
-  // ── Parse date params from dashboard URL ──────────────────────────────────
-  Map<String, String> _parseDateParams(String url) {
-    try {
-      final uri = Uri.parse(url);
-      final p = uri.queryParameters;
-      return {
-        if (p['from_date'] != null) 'from_date': p['from_date']!,
-        if (p['to_date'] != null) 'to_date': p['to_date']!,
-      };
-    } catch (_) {
-      return {};
-    }
-  }
-
-  // ── Storage permission only needed Android <= 9 ───────────────────────────
-  Future<bool> _requestPermissionIfNeeded() async {
-    if (!Platform.isAndroid) return true;
-    try {
-      final result = await Process.run('getprop', ['ro.build.version.sdk']);
-      final sdk = int.tryParse(result.stdout.toString().trim()) ?? 29;
-      if (sdk <= 28) {
-        final status = await Permission.storage.request();
-        return status.isGranted;
-      }
-      return true;
-    } catch (_) {
-      return true;
-    }
-  }
-
+  // ── Intercept /export navigation → trigger JS to grab cookie + call back ──
   Future<void> _downloadFile(String interceptedUrl) async {
+    final isPdf = interceptedUrl.contains('pdf');
+    final type = isPdf ? 'pdf' : 'csv';
+
+    // Inject JS: read document.cookie and send back via FlutterDownload channel
+    await _controller.runJavaScript('''
+      (function() {
+        var cookie = document.cookie || '';
+        FlutterDownload.postMessage('$type|' + cookie);
+      })();
+    ''');
+  }
+
+  // ── Actual download using cookie passed from JS ────────────────────────────
+  Future<void> _downloadWithCookie(String type, String cookie) async {
     final granted = await _requestPermissionIfNeeded();
     if (!granted) {
       _showMsg('❌ Storage permission denied');
@@ -134,85 +118,91 @@ class _BudgetWebViewState extends State<BudgetWebView> {
     });
 
     try {
-      final isPdf = interceptedUrl.contains('pdf');
+      final isPdf = type == 'pdf';
       final ext = isPdf ? 'pdf' : 'csv';
       final ts = DateTime.now().millisecondsSinceEpoch;
       final fileName = 'IntelliBudget_$ts.$ext';
 
-      // App documents dir — works all Android versions without permission
       final dir = await getApplicationDocumentsDirectory();
       final savePath = '${dir.path}/$fileName';
 
-      // Get date params from current webview page URL
+      // Get date params from current URL
       final currentUrl = await _controller.currentUrl() ?? _baseUrl;
-      final dateParams = _parseDateParams(currentUrl);
+      Map<String, String> dateParams = {};
+      try {
+        final uri = Uri.parse(currentUrl);
+        final p = uri.queryParameters;
+        if (p['from_date'] != null) dateParams['from_date'] = p['from_date']!;
+        if (p['to_date'] != null) dateParams['to_date'] = p['to_date']!;
+      } catch (_) {}
 
-      // Build download URL (same endpoints Flask already has)
       final downloadUri = isPdf
           ? Uri.parse('$_baseUrl/export/pdf')
               .replace(queryParameters: dateParams.isEmpty ? null : dateParams)
           : Uri.parse('$_baseUrl/export');
 
-      // Get session cookies from WebView (user already logged in)
-      final cookieHeader = await _getSessionCookieHeader();
-      if (cookieHeader == null || cookieHeader.isEmpty) {
-        _showMsg('❌ Not logged in — please login first');
-        setState(() => _isDownloading = false);
-        return;
-      }
-
+      // Flask session is HttpOnly — document.cookie won't have it.
+      // So we use JS fetch (which DOES send HttpOnly cookies automatically)
+      // and receive the file bytes via base64 back to Flutter.
       setState(() => _downloadMsg = '⬇️ Downloading...');
 
-      // Dio GET with cookie header — Flask sees authenticated user
-      final dio = Dio();
-      final response = await dio.get<List<int>>(
-        downloadUri.toString(),
-        options: Options(
-          responseType: ResponseType.bytes,
-          followRedirects: true,
-          validateStatus: (s) => s != null && s < 500,
-          receiveTimeout: const Duration(seconds: 60),
-          sendTimeout: const Duration(seconds: 15),
-          headers: {
-            'Cookie': cookieHeader,
-            'Accept': isPdf ? 'application/pdf' : 'text/csv',
-          },
-        ),
-      );
+      final b64Result = await _controller.runJavaScriptReturningResult('''
+        (async function() {
+          try {
+            const url = '${downloadUri.toString()}';
+            const resp = await fetch(url, {
+              credentials: 'include',
+              headers: { 'Accept': '${isPdf ? 'application/pdf' : 'text/csv'}' }
+            });
+            if (!resp.ok) return 'ERROR:' + resp.status;
+            const ct = resp.headers.get('content-type') || '';
+            if (ct.includes('text/html')) return 'ERROR:html';
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+              binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+          } catch(e) {
+            return 'ERROR:' + e.toString();
+          }
+        })()
+      ''');
 
-      // Validate response code
-      if (response.statusCode == 401 || response.statusCode == 302) {
-        _showMsg('❌ Session expired — please login again');
+      final b64 = b64Result.toString().replaceAll('"', '').trim();
+
+      if (b64.startsWith('ERROR:')) {
+        final reason = b64.substring(6);
+        if (reason == 'html' || reason == '401' || reason == '302') {
+          _showMsg('❌ Session expired — please login again');
+        } else {
+          _showMsg('❌ Download failed: $reason');
+        }
         setState(() => _isDownloading = false);
         return;
       }
 
-      final bytes = response.data;
-      if (bytes == null || bytes.isEmpty) {
-        _showMsg('❌ Server returned empty response');
+      if (b64.isEmpty) {
+        _showMsg('❌ Empty response from server');
         setState(() => _isDownloading = false);
         return;
       }
 
-      // Check not HTML error page
-      final contentType = response.headers['content-type']?.first ?? '';
-      if (contentType.contains('text/html')) {
-        _showMsg('❌ Session expired — please login again');
-        setState(() => _isDownloading = false);
-        return;
-      }
+      // Decode base64 → bytes
+      final bytes = _base64ToBytes(b64);
 
-      // Verify PDF magic bytes %PDF-
+      // Verify PDF magic bytes
       if (isPdf && bytes.length > 4) {
         final magic = String.fromCharCodes(bytes.sublist(0, 5));
         if (!magic.startsWith('%PDF')) {
-          _showMsg('❌ Invalid PDF from server');
+          _showMsg('❌ Invalid PDF received');
           setState(() => _isDownloading = false);
           return;
         }
       }
 
-      // Write to disk
+      // Write file
       await File(savePath).writeAsBytes(bytes, flush: true);
 
       setState(() {
@@ -220,7 +210,6 @@ class _BudgetWebViewState extends State<BudgetWebView> {
         _downloadMsg = '✅ Downloaded! Opening...';
       });
 
-      // Open in-app with system viewer (no browser)
       final openResult = await OpenFilex.open(savePath);
       if (openResult.type == ResultType.noAppToOpen) {
         _showMsg('✅ Saved: $fileName\n(Install a PDF viewer to open)');
@@ -235,6 +224,41 @@ class _BudgetWebViewState extends State<BudgetWebView> {
       _showMsg('❌ Network error: ${e.type.name}');
     } catch (e) {
       _showMsg('❌ Error: ${e.toString().split('\n').first}');
+    }
+  }
+
+  // ── Pure Dart base64 decode (no extra package) ────────────────────────────
+  List<int> _base64ToBytes(String b64) {
+    const chars =
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    final clean = b64.replaceAll(RegExp(r'[^A-Za-z0-9+/=]'), '');
+    final bytes = <int>[];
+    for (var i = 0; i < clean.length; i += 4) {
+      final a = chars.indexOf(clean[i]);
+      final b = chars.indexOf(clean[i + 1]);
+      final c = i + 2 < clean.length ? chars.indexOf(clean[i + 2]) : 0;
+      final d = i + 3 < clean.length ? chars.indexOf(clean[i + 3]) : 0;
+      bytes.add((a << 2) | (b >> 4));
+      if (c != -1 && clean[i + 2] != '=') bytes.add(((b & 0xF) << 4) | (c >> 2));
+      if (d != -1 && i + 3 < clean.length && clean[i + 3] != '=') {
+        bytes.add(((c & 0x3) << 6) | d);
+      }
+    }
+    return bytes;
+  }
+
+  Future<bool> _requestPermissionIfNeeded() async {
+    if (!Platform.isAndroid) return true;
+    try {
+      final result = await Process.run('getprop', ['ro.build.version.sdk']);
+      final sdk = int.tryParse(result.stdout.toString().trim()) ?? 29;
+      if (sdk <= 28) {
+        final status = await Permission.storage.request();
+        return status.isGranted;
+      }
+      return true;
+    } catch (_) {
+      return true;
     }
   }
 
