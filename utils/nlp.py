@@ -2,7 +2,6 @@
 import re
 from datetime import datetime, timedelta
 
-# ── Try to import dateparser (optional) ──────────────────────────────────────
 try:
     import dateparser
     _DATEPARSER_AVAILABLE = True
@@ -10,7 +9,6 @@ except ImportError:
     _DATEPARSER_AVAILABLE = False
 
 
-# ── Category keyword map ──────────────────────────────────────────────────────
 CATEGORY_KEYWORDS = {
     'Food':       ['food', 'eat', 'lunch', 'dinner', 'breakfast', 'restaurant',
                    'grocery', 'groceries', 'snack', 'coffee', 'meal', 'swiggy',
@@ -20,7 +18,11 @@ CATEGORY_KEYWORDS = {
     'Shopping':   ['shopping', 'clothes', 'shirt', 'shoes', 'amazon', 'flipkart',
                    'myntra', 'dress', 'purchase', 'buy', 'bought'],
     'Health':     ['health', 'medicine', 'doctor', 'hospital', 'pharmacy',
-                   'medical', 'clinic', 'tablet', 'drug', 'gym', 'fitness'],
+                   'medical', 'clinic', 'tablet', 'drug', 'gym', 'fitness',
+                   'eye', 'dental', 'dentist', 'checkup', 'check up', 'check-up',
+                   'consultation', 'test', 'lab', 'blood', 'xray', 'x-ray',
+                   'scan', 'surgery', 'treatment', 'therapy', 'optical',
+                   'spectacles', 'glasses', 'vision'],
     'Education':  ['education', 'book', 'course', 'school', 'college', 'fees',
                    'tuition', 'study', 'class', 'udemy', 'coursera'],
     'Bills':      ['bill', 'electricity', 'water', 'rent', 'internet', 'wifi',
@@ -43,20 +45,41 @@ _MONTHS = {
     'oct': 10, 'nov': 11, 'dec': 12,
 }
 
+# Numbers that appear as time references — must NOT be treated as amounts
+# Pattern: "<N> days back/ago", "<N> weeks ago", "<N> months ago"
+_TIME_REF_PAT = re.compile(
+    r'\b(\d+)\s+(?:days?\s+(?:ago|back)|weeks?\s+ago|months?\s+ago)\b',
+    re.IGNORECASE
+)
 
-# ── Amount + category extraction ─────────────────────────────────────────────
+
+def _mask_time_refs(text: str) -> str:
+    """Replace time-reference numbers with placeholder so amount regex skips them."""
+    return _TIME_REF_PAT.sub(lambda m: m.group(0).replace(m.group(1), 'DAYS'), text)
+
 
 def extract_amount_category(text: str, user_id: int = None):
+    """
+    Extract (amount, category) from a natural-language expense message.
+    Time references like "5 days back" are excluded from amount candidates.
+    """
     text_lower = text.lower()
 
+    # ── Mask time references before amount extraction ─────────────────────────
+    masked = _mask_time_refs(text_lower)
+
+    # ── Amount extraction — runs on masked text ───────────────────────────────
     amount = None
     amount_patterns = [
+        # Currency prefix: rs.500, ₹500, inr 500  ← highest priority
         r'(?:rs\.?|₹|inr\s*)(\d[\d,]*(?:\.\d{1,2})?)',
+        # Currency suffix: 500 rs, 500 rupees
         r'(\d[\d,]*(?:\.\d{1,2})?)\s*(?:rs\.?|₹|rupees?)',
+        # Bare number (fallback)
         r'\b(\d[\d,]*(?:\.\d{1,2})?)\b',
     ]
     for pattern in amount_patterns:
-        match = re.search(pattern, text_lower)
+        match = re.search(pattern, masked)
         if match:
             raw = match.group(1).replace(',', '')
             try:
@@ -65,6 +88,7 @@ def extract_amount_category(text: str, user_id: int = None):
             except ValueError:
                 continue
 
+    # ── Category extraction ───────────────────────────────────────────────────
     def _norm(s: str) -> str:
         return re.sub(r'[^a-z0-9]+', ' ', (s or '').lower()).strip()
 
@@ -73,7 +97,9 @@ def extract_amount_category(text: str, user_id: int = None):
     if m:
         explicit = m.group(1).strip()
 
-    candidates = set(CATEGORY_KEYWORDS.keys()) | {'Other', 'Bills', 'Food', 'Transport', 'Shopping', 'Health', 'Education'}
+    candidates = set(CATEGORY_KEYWORDS.keys()) | {
+        'Other', 'Bills', 'Food', 'Transport', 'Shopping', 'Health', 'Education'
+    }
     if user_id is not None:
         try:
             from models import UserCategory
@@ -93,6 +119,16 @@ def extract_amount_category(text: str, user_id: int = None):
         for k, orig in norm_map.items():
             if ne and (ne in k or k in ne):
                 return amount, orig
+
+    # Multi-word keyword check first (longer matches win)
+    multi_kw = {
+        'Health': ['eye check up', 'eye check-up', 'eye checkup', 'check up',
+                   'check-up', 'eye test', 'blood test', 'lab test'],
+    }
+    for cat, keywords in multi_kw.items():
+        for kw in keywords:
+            if kw in text_lower:
+                return amount, cat
 
     for cat, keywords in CATEGORY_KEYWORDS.items():
         for kw in keywords:
@@ -118,7 +154,6 @@ def extract_description(text: str) -> str:
 # ── Date extraction ───────────────────────────────────────────────────────────
 
 def _make_date(day: int, month: int, year: int) -> datetime:
-    """Safe date constructor — clamps day to valid range."""
     import calendar
     max_day = calendar.monthrange(year, month)[1]
     day = max(1, min(day, max_day))
@@ -127,38 +162,47 @@ def _make_date(day: int, month: int, year: int) -> datetime:
 
 def extract_date(text: str) -> datetime:
     """
-    Extract date from free-form text.
-
-    Priority order:
+    Extract date from free-form text. Priority:
       1. today / yesterday / day before yesterday
-      2. N days ago
+      2. N days ago / N days back
       3. last/this <weekday>
-      4. Ordinal/named month  — "24th april", "april 24", "25 apr 2025"
-      5. Numeric              — DD/MM, DD/MM/YYYY, DD-MM-YYYY
-      6. dateparser (if installed)
-      7. Fallback → today
+      4. "<day>[ordinal] <month> [year]"  — "24th april", "25 apr 2026"
+      5. "<month> <day>[ordinal] [year]"  — "april 24th", "Apr 24"
+      6. Numeric DD/MM/YYYY or DD/MM
+      7. dateparser fallback
+      8. today
     """
     today   = datetime.utcnow()
     text_lo = text.lower()
 
-    # 1. today
     if re.search(r'\btoday\b', text_lo):
         return today
 
-    # 2. day before yesterday
     if re.search(r'\bday before yesterday\b', text_lo):
         return today - timedelta(days=2)
 
-    # 3. yesterday
     if re.search(r'\byesterday\b', text_lo):
         return today - timedelta(days=1)
 
-    # 4. N days ago
-    m = re.search(r'(\d+)\s+days?\s+ago', text_lo)
+    # "N days ago" OR "N days back"
+    m = re.search(r'(\d+)\s+days?\s+(?:ago|back)', text_lo)
     if m:
         return today - timedelta(days=int(m.group(1)))
 
-    # 5. last <weekday>
+    m = re.search(r'(\d+)\s+weeks?\s+ago', text_lo)
+    if m:
+        return today - timedelta(weeks=int(m.group(1)))
+
+    m = re.search(r'(\d+)\s+months?\s+ago', text_lo)
+    if m:
+        # Approximate month ago
+        month = today.month - int(m.group(1))
+        year  = today.year
+        while month < 1:
+            month += 12
+            year  -= 1
+        return _make_date(today.day, month, year)
+
     m = re.search(
         r'last\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
         text_lo
@@ -168,7 +212,6 @@ def extract_date(text: str) -> datetime:
         delta  = (today.weekday() - target) % 7 or 7
         return today - timedelta(days=delta)
 
-    # 6. this <weekday>
     m = re.search(
         r'this\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
         text_lo
@@ -178,11 +221,9 @@ def extract_date(text: str) -> datetime:
         delta  = (today.weekday() - target) % 7
         return today - timedelta(days=delta)
 
-    # ── Month name helpers ────────────────────────────────────────────────────
-    month_pat = '|'.join(_MONTHS.keys())  # jan|feb|...|december
+    month_pat = '|'.join(_MONTHS.keys())
 
-    # 7. "<day>[st/nd/rd/th] <month> [<year>]"
-    #    e.g. "24th april", "24th april 2026", "1st jan"
+    # "<day>[ordinal] <month> [year]"
     m = re.search(
         rf'(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pat})(?:\s+(\d{{4}}))?',
         text_lo
@@ -192,13 +233,11 @@ def extract_date(text: str) -> datetime:
         month = _MONTHS[m.group(2)]
         year  = int(m.group(3)) if m.group(3) else today.year
         dt    = _make_date(day, month, year)
-        # If date is in the future and no year specified → use last year
         if dt > today and not m.group(3):
             dt = _make_date(day, month, year - 1)
         return dt
 
-    # 8. "<month> <day>[st/nd/rd/th] [<year>]"
-    #    e.g. "april 24th", "april 24", "Apr 24 2026"
+    # "<month> <day>[ordinal] [year]"
     m = re.search(
         rf'({month_pat})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:\s+(\d{{4}}))?',
         text_lo
@@ -212,7 +251,7 @@ def extract_date(text: str) -> datetime:
             dt = _make_date(day, month, year - 1)
         return dt
 
-    # 9. Numeric: DD/MM/YYYY or DD-MM-YYYY
+    # Numeric DD/MM/YYYY
     m = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', text_lo)
     if m:
         try:
@@ -220,7 +259,7 @@ def extract_date(text: str) -> datetime:
         except ValueError:
             pass
 
-    # 10. Numeric short: DD/MM or DD-MM  (assume current year)
+    # Numeric DD/MM (current year)
     m = re.search(r'\b(\d{1,2})[/\-](\d{1,2})\b', text_lo)
     if m:
         try:
@@ -231,7 +270,6 @@ def extract_date(text: str) -> datetime:
         except ValueError:
             pass
 
-    # 11. Delegate to dateparser as last resort
     if _DATEPARSER_AVAILABLE:
         parsed = dateparser.parse(
             text,
@@ -244,5 +282,4 @@ def extract_date(text: str) -> datetime:
         if parsed:
             return parsed
 
-    # 12. Fallback
     return today
